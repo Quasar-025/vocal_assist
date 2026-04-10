@@ -1,0 +1,6 @@
+fist
+open_palm
+point
+ok
+wave_left
+wave_right
