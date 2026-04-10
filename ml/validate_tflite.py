@@ -15,6 +15,14 @@ def main():
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
+    raw = model_path.read_bytes()
+    if len(raw) < 4 or raw[:4] != b"TFL3":
+        raise ValueError(
+            "Invalid model file: missing TFL3 header. "
+            "This file is not a real TensorFlow Lite model. "
+            "Re-run training/export and ensure conversion succeeds before validation."
+        )
+
     interpreter = tf.lite.Interpreter(model_path=str(model_path))
     interpreter.allocate_tensors()
 

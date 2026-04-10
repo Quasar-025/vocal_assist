@@ -46,6 +46,7 @@ dependencies:
   tflite_flutter: ^0.11.0
   google_mlkit_pose_detection: ^0.14.1
   google_mlkit_commons: ^0.11.1
+  mqtt_client: ^10.5.1
 
 dev_dependencies:
   flutter_test:

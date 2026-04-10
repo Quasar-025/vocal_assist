@@ -22,8 +22,16 @@ py -3.11 -m venv .venv311
 ```
 
 Why 3.11:
-- TensorFlow 2.16.x is stable on Python 3.11 for this workflow.
+- TensorFlow 2.15.x is stable on Python 3.11 for this workflow.
 - If you use Python 3.12/3.13, the requirements file will switch to TensorFlow 2.21 automatically.
+
+If you previously installed TensorFlow 2.16 in `.venv311`, reinstall dependencies after the requirement update:
+
+```bash
+.venv311\Scripts\python.exe -m pip uninstall -y tensorflow tensorflow-intel keras
+.venv311\Scripts\python.exe -m pip install --upgrade pip
+.venv311\Scripts\python.exe -m pip install -r ml/requirements.txt
+```
 
 ## 2) Collect dataset
 This opens webcam capture and stores grayscale 224x224 images.
@@ -80,13 +88,3 @@ This confirms the model can load and that output class count is 6.
 - Current app pipeline feeds grayscale camera frames resized to 224x224 into the model.
 - Model output must be a softmax vector of length 6.
 - If validation accuracy is below 0.85, collect more data and retrain.
-
-
-py -3.11 -m venv .venv311
-.venv311\Scripts\python.exe -m pip install --upgrade pip
-.venv311\Scripts\python.exe -m pip install -r ml/requirements.txt
-
-Then run your model pipeline
-.venv311\Scripts\python.exe ml/collect_dataset.py --reset --samples-per-class 250 --image-size 224
-.venv311\Scripts\python.exe ml/train_model.py --dataset-dir ml/dataset --artifacts-dir ml/artifacts --epochs 20 --copy-to-app
-.venv311\Scripts\python.exe ml/validate_tflite.py --model assets/models/gesture_classifier.tflite --classes 6

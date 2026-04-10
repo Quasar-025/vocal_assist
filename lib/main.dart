@@ -9,6 +9,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:gesture_voice_app/services/camera_gesture_service.dart';
+import 'package:gesture_voice_app/services/wokwi_mqtt_service.dart';
 import 'package:gesture_voice_app/widgets/hand_landmark_painter.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
@@ -23,7 +24,7 @@ void main() {
 
 enum ConnectionStateLabel { idle, scanning, connecting, connected, demo }
 
-enum InputSourceMode { ble, camera }
+enum InputSourceMode { ble, camera, wokwi }
 
 class GestureRecord {
   GestureRecord({
@@ -57,6 +58,7 @@ class GestureController extends ChangeNotifier {
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
   final CameraGestureService _cameraService = CameraGestureService();
+  final WokwiMqttService _wokwiService = WokwiMqttService();
 
   List<ScanResult> scannedDevices = <ScanResult>[];
   BluetoothDevice? connectedDevice;
@@ -94,6 +96,7 @@ class GestureController extends ChangeNotifier {
   StreamSubscription<List<int>>? _notifySubscription;
   StreamSubscription<BluetoothConnectionState>? _deviceConnectionSubscription;
   StreamSubscription<CameraGestureEvent>? _cameraSubscription;
+  StreamSubscription<WokwiGestureEvent>? _wokwiSubscription;
   Timer? _demoTimer;
   final Random _random = Random();
 
@@ -106,6 +109,10 @@ class GestureController extends ChangeNotifier {
   List<LandmarkConnection> get handLandmarkConnections =>
       _cameraService.handLandmarkConnections;
   ValueNotifier<int> get cameraOverlayVersion => _cameraService.overlayVersion;
+  bool get wokwiConnected => _wokwiService.isConnected;
+  String get wokwiStatusMessage => _wokwiService.statusMessage;
+  String get wokwiTopic => _wokwiService.topic;
+  String get wokwiBroker => _wokwiService.broker;
 
   String gestureName(int gestureId) {
     return _gestureNames[gestureId] ?? 'Gesture $gestureId';
@@ -122,6 +129,8 @@ class GestureController extends ChangeNotifier {
 
     if (inputMode == InputSourceMode.camera) {
       await _startCameraMode();
+    } else if (inputMode == InputSourceMode.wokwi) {
+      await _startWokwiMode();
     }
   }
 
@@ -173,7 +182,13 @@ class GestureController extends ChangeNotifier {
     selectedLanguage = prefs.getString('selectedLanguage') ?? 'en-US';
     activeProfile = prefs.getString('activeProfile') ?? 'Demo Mode';
     final String mode = prefs.getString('inputMode') ?? 'ble';
-    inputMode = mode == 'camera' ? InputSourceMode.camera : InputSourceMode.ble;
+    if (mode == 'camera') {
+      inputMode = InputSourceMode.camera;
+    } else if (mode == 'wokwi') {
+      inputMode = InputSourceMode.wokwi;
+    } else {
+      inputMode = InputSourceMode.ble;
+    }
 
     final String? encodedProfiles = prefs.getString('profiles');
     if (encodedProfiles != null && encodedProfiles.isNotEmpty) {
@@ -238,7 +253,16 @@ class GestureController extends ChangeNotifier {
     await prefs.setDouble('speechVolume', speechVolume);
     await prefs.setString('selectedLanguage', selectedLanguage);
     await prefs.setString('activeProfile', activeProfile);
-    await prefs.setString('inputMode', inputMode == InputSourceMode.camera ? 'camera' : 'ble');
+    final String modeValue;
+    switch (inputMode) {
+      case InputSourceMode.camera:
+        modeValue = 'camera';
+      case InputSourceMode.wokwi:
+        modeValue = 'wokwi';
+      case InputSourceMode.ble:
+        modeValue = 'ble';
+    }
+    await prefs.setString('inputMode', modeValue);
 
     final Map<String, dynamic> serializable = profiles.map(
       (String key, Map<int, Map<String, String>> value) =>
@@ -371,8 +395,12 @@ class GestureController extends ChangeNotifier {
     if (mode == InputSourceMode.camera) {
       await disconnect();
       await _startCameraMode();
+    } else if (mode == InputSourceMode.wokwi) {
+      await disconnect();
+      await _startWokwiMode();
     } else {
       await _stopCameraMode();
+      await _stopWokwiMode();
       statusMessage = 'BLE mode active';
     }
 
@@ -409,8 +437,31 @@ class GestureController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _startWokwiMode() async {
+    await _wokwiSubscription?.cancel();
+    try {
+      await _wokwiService.connect();
+      _wokwiSubscription = _wokwiService.events.listen((WokwiGestureEvent event) {
+        unawaited(_handleGestureId(event.gestureId, source: 'Wokwi MQTT'));
+      });
+      connectionState = ConnectionStateLabel.idle;
+      statusMessage =
+          'Wokwi connected (${_wokwiService.broker} / ${_wokwiService.topic})';
+    } catch (e) {
+      statusMessage = 'Wokwi connect failed: $e';
+    }
+    notifyListeners();
+  }
+
+  Future<void> _stopWokwiMode() async {
+    await _wokwiSubscription?.cancel();
+    _wokwiSubscription = null;
+    await _wokwiService.disconnect();
+    notifyListeners();
+  }
+
   Future<void> startScan() async {
-    if (inputMode == InputSourceMode.camera) {
+    if (inputMode != InputSourceMode.ble) {
       await setInputMode(InputSourceMode.ble);
     }
 
@@ -451,7 +502,7 @@ class GestureController extends ChangeNotifier {
   }
 
   Future<void> connectToDevice(BluetoothDevice device) async {
-    if (inputMode == InputSourceMode.camera) {
+    if (inputMode != InputSourceMode.ble) {
       await setInputMode(InputSourceMode.ble);
     }
 
@@ -524,6 +575,7 @@ class GestureController extends ChangeNotifier {
     await _deviceConnectionSubscription?.cancel();
     _demoTimer?.cancel();
     await _stopCameraMode();
+    await _stopWokwiMode();
 
     if (connectedDevice != null) {
       await connectedDevice!.disconnect();
@@ -620,8 +672,8 @@ class GestureController extends ChangeNotifier {
 
     final String phrase = phraseForGesture(gestureId);
     lastGestureId = gestureId;
-    lastPhrase = phrase;
-    statusMessage = 'Recognized ${gestureName(gestureId)} from $source';
+        lastPhrase = phrase;
+        statusMessage = 'Recognized "$phrase" from $source';
     _addHistory(gestureId, phrase);
     notifyListeners();
 
@@ -789,7 +841,9 @@ class GestureController extends ChangeNotifier {
     unawaited(_notifySubscription?.cancel());
     unawaited(_deviceConnectionSubscription?.cancel());
     unawaited(_cameraSubscription?.cancel());
+    unawaited(_wokwiSubscription?.cancel());
     unawaited(_cameraService.dispose());
+    unawaited(_wokwiService.dispose());
     _demoTimer?.cancel();
     unawaited(_tts.stop());
     super.dispose();
@@ -975,15 +1029,17 @@ class LiveViewPage extends StatelessWidget {
                   Chip(label: Text('Profile: ${controller.activeProfile}')),
                   Chip(
                     label: Text(
-                      controller.inputMode == InputSourceMode.camera
-                          ? 'Mode: Camera'
-                          : 'Mode: BLE',
+                      switch (controller.inputMode) {
+                        InputSourceMode.camera => 'Mode: Camera',
+                        InputSourceMode.wokwi => 'Mode: Wokwi',
+                        InputSourceMode.ble => 'Mode: BLE',
+                      },
                     ),
                   ),
                   if (controller.lastGestureId != null)
                     Chip(
                       label: Text(
-                        'Gesture: ${controller.gestureName(controller.lastGestureId!)}',
+                            'Phrase: ${controller.lastPhrase}',
                       ),
                     ),
                 ],
@@ -1000,6 +1056,11 @@ class LiveViewPage extends StatelessWidget {
                     value: InputSourceMode.camera,
                     label: Text('Camera'),
                     icon: Icon(Icons.camera_alt),
+                  ),
+                  ButtonSegment<InputSourceMode>(
+                    value: InputSourceMode.wokwi,
+                    label: Text('Wokwi'),
+                    icon: Icon(Icons.memory),
                   ),
                 ],
                 selected: <InputSourceMode>{controller.inputMode},
@@ -1023,7 +1084,9 @@ class LiveViewPage extends StatelessWidget {
                     ),
                     padding: const EdgeInsets.all(24),
                     child: controller.inputMode == InputSourceMode.camera
-                        ? _buildCameraPanel(context)
+                      ? _buildCameraPanel(context)
+                      : controller.inputMode == InputSourceMode.wokwi
+                        ? _buildWokwiPanel(context)
                         : Center(
                             child: Text(
                               controller.lastPhrase,
@@ -1050,6 +1113,12 @@ class LiveViewPage extends StatelessWidget {
               if (controller.inputMode == InputSourceMode.camera)
                 Text(
                   controller.cameraStatusMessage,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              if (controller.inputMode == InputSourceMode.wokwi)
+                Text(
+                  controller.wokwiStatusMessage,
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
@@ -1152,6 +1221,39 @@ class LiveViewPage extends StatelessWidget {
                 ),
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWokwiPanel(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: <Widget>[
+          Icon(
+            controller.wokwiConnected ? Icons.cloud_done : Icons.cloud_off,
+            size: 52,
+            color: controller.wokwiConnected ? Colors.green : Colors.orange,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            controller.wokwiConnected
+                ? 'Connected to Wokwi MQTT'
+                : 'Waiting for Wokwi MQTT',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Broker: ${controller.wokwiBroker}\nTopic: ${controller.wokwiTopic}',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'Move potentiometers in Wokwi to publish gesture IDs.',
+            textAlign: TextAlign.center,
+          ),
         ],
       ),
     );

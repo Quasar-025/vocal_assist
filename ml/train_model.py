@@ -1,5 +1,6 @@
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -57,10 +58,68 @@ def save_training_plot(history, out_png: Path) -> None:
 
 
 def convert_to_tflite(model: tf.keras.Model, out_path: Path) -> None:
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    out_path.write_bytes(tflite_model)
+    errors = []
+
+    # Attempt 1: stable baseline conversion without optimizations.
+    try:
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        tflite_model = converter.convert()
+        if tflite_model[:4] != b"TFL3":
+            raise ValueError(
+                "Generated file is not a valid TFLite flatbuffer (missing TFL3 header)"
+            )
+        out_path.write_bytes(tflite_model)
+        return
+    except Exception as e:
+        errors.append(f"baseline conversion failed: {e}")
+
+    # Attempt 2: concrete function path with TF ops fallback for converter edge cases.
+    try:
+        input_spec = tf.TensorSpec(
+            shape=(1, model.input_shape[1], model.input_shape[2], model.input_shape[3]),
+            dtype=tf.float32,
+        )
+        concrete = tf.function(model).get_concrete_function(input_spec)
+        converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], model)
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.SELECT_TF_OPS,
+        ]
+        converter.experimental_enable_resource_variables = True
+        converter._experimental_lower_tensor_list_ops = False
+        tflite_model = converter.convert()
+        if tflite_model[:4] != b"TFL3":
+            raise ValueError(
+                "Generated file is not a valid TFLite flatbuffer (missing TFL3 header)"
+            )
+        out_path.write_bytes(tflite_model)
+        return
+    except Exception as e:
+        errors.append(f"concrete conversion failed: {e}")
+
+    # Attempt 3: export SavedModel first, then convert from SavedModel.
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            export_dir = Path(tmp) / "saved_model"
+            model.export(export_dir)
+            converter = tf.lite.TFLiteConverter.from_saved_model(str(export_dir))
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+                tf.lite.OpsSet.SELECT_TF_OPS,
+            ]
+            converter.experimental_enable_resource_variables = True
+            converter._experimental_lower_tensor_list_ops = False
+            tflite_model = converter.convert()
+        if tflite_model[:4] != b"TFL3":
+            raise ValueError(
+                "Generated file is not a valid TFLite flatbuffer (missing TFL3 header)"
+            )
+        out_path.write_bytes(tflite_model)
+        return
+    except Exception as e:
+        errors.append(f"saved_model conversion failed: {e}")
+
+    raise RuntimeError("TFLite conversion failed in all strategies:\n- " + "\n- ".join(errors))
 
 
 def main():
@@ -162,7 +221,12 @@ def main():
 
     if args.copy_to_app:
         app_model_path = Path("assets/models/gesture_classifier.tflite")
-        app_model_path.write_bytes(tflite_path.read_bytes())
+        raw = tflite_path.read_bytes()
+        if raw[:4] != b"TFL3":
+            raise ValueError(
+                f"Refusing to copy invalid model file: {tflite_path} (missing TFL3 header)"
+            )
+        app_model_path.write_bytes(raw)
         print(f"Copied model to app asset path: {app_model_path}")
 
 
