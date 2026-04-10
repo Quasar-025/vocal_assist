@@ -43,6 +43,10 @@ class GestureRecord {
 class GestureController extends ChangeNotifier {
   static const int _maxHistory = 20;
   static const String _defaultFallback = 'No gesture detected';
+  static const String _espServiceUuid =
+      '7f9e1167-95e5-4afb-8f4e-91b0d5134d44';
+  static const String _espGestureCharUuid =
+      'c9f1e18f-78f0-4d5b-a0cb-bc8fc4e6719c';
   static const List<int> _demoGestureIds = <int>[1, 2, 3, 4, 5, 6];
 
   static const Map<int, String> _gestureNames = <int, String>{
@@ -99,6 +103,7 @@ class GestureController extends ChangeNotifier {
   StreamSubscription<WokwiGestureEvent>? _wokwiSubscription;
   Timer? _demoTimer;
   final Random _random = Random();
+  String _bleTextBuffer = '';
 
   CameraController? get cameraController => _cameraService.cameraController;
   String get cameraStatusMessage => _cameraService.statusMessage;
@@ -537,17 +542,61 @@ class GestureController extends ChangeNotifier {
 
       final List<BluetoothService> services = await device.discoverServices();
       BluetoothCharacteristic? candidate;
+
+      // 1) Prefer exact service+characteristic UUID from ESP firmware.
       for (final BluetoothService service in services) {
+        final bool serviceMatch =
+            service.uuid.str.toLowerCase() == _espServiceUuid;
+        if (!serviceMatch) {
+          continue;
+        }
         for (final BluetoothCharacteristic characteristic
             in service.characteristics) {
-          if (characteristic.properties.notify ||
-              characteristic.properties.indicate) {
+          final bool charMatch =
+              characteristic.uuid.str.toLowerCase() == _espGestureCharUuid;
+          if (charMatch &&
+              (characteristic.properties.notify ||
+                  characteristic.properties.indicate)) {
             candidate = characteristic;
             break;
           }
         }
-        if (candidate != null) {
-          break;
+      }
+
+      // 2) Fallback: match characteristic UUID anywhere.
+      if (candidate == null) {
+        for (final BluetoothService service in services) {
+          for (final BluetoothCharacteristic characteristic
+              in service.characteristics) {
+            final bool charMatch =
+                characteristic.uuid.str.toLowerCase() == _espGestureCharUuid;
+            if (charMatch &&
+                (characteristic.properties.notify ||
+                    characteristic.properties.indicate)) {
+              candidate = characteristic;
+              break;
+            }
+          }
+          if (candidate != null) {
+            break;
+          }
+        }
+      }
+
+      // 3) Last fallback: first notifiable characteristic.
+      if (candidate == null) {
+        for (final BluetoothService service in services) {
+          for (final BluetoothCharacteristic characteristic
+              in service.characteristics) {
+            if (characteristic.properties.notify ||
+                characteristic.properties.indicate) {
+              candidate = characteristic;
+              break;
+            }
+          }
+          if (candidate != null) {
+            break;
+          }
         }
       }
 
@@ -561,7 +610,8 @@ class GestureController extends ChangeNotifier {
           notifyCharacteristic!.lastValueStream.listen(_parseIncomingData);
 
       connectionState = ConnectionStateLabel.connected;
-      statusMessage = 'Connected and listening';
+        statusMessage =
+          'Connected: ${notifyCharacteristic!.uuid.str.substring(0, 8)}...';
     } catch (e) {
       connectionState = ConnectionStateLabel.idle;
       statusMessage = 'Connection failed: $e';
@@ -638,27 +688,43 @@ class GestureController extends ChangeNotifier {
       return;
     }
 
-    final String decoded = utf8.decode(value, allowMalformed: true).trim();
-    int? gestureId = int.tryParse(decoded);
+    final String decoded = utf8.decode(value, allowMalformed: true);
+    _bleTextBuffer += decoded;
 
-    if (gestureId == null) {
-      final String numbersOnly = decoded.replaceAll(RegExp(r'[^0-9-]'), '');
-      gestureId = int.tryParse(numbersOnly);
-    }
+    // Preferred framing: one gesture id per line from firmware.
+    final List<String> parts = _bleTextBuffer.split(RegExp(r'\r?\n'));
+    _bleTextBuffer = parts.removeLast();
 
-    if (gestureId == null) {
-      if (value.length == 1) {
-        gestureId = value.first;
-      } else {
-        lastGestureId = null;
-        lastPhrase = _fallbackPhraseForLanguage(selectedLanguage);
-        statusMessage = 'Invalid gesture payload';
-        notifyListeners();
-        return;
+    bool processed = false;
+    for (final String raw in parts) {
+      final String token = raw.trim();
+      if (token.isEmpty) {
+        continue;
+      }
+
+      int? gestureId = int.tryParse(token);
+      if (gestureId == null) {
+        final String numbersOnly = token.replaceAll(RegExp(r'[^0-9-]'), '');
+        gestureId = int.tryParse(numbersOnly);
+      }
+
+      if (gestureId != null) {
+        processed = true;
+        unawaited(_handleGestureId(gestureId, source: 'BLE'));
       }
     }
 
-    unawaited(_handleGestureId(gestureId, source: 'BLE'));
+    // Fallback for payloads delivered as a single raw byte (1..6) with no newline.
+    if (!processed && value.length == 1 && value.first >= 1 && value.first <= 6) {
+      processed = true;
+      unawaited(_handleGestureId(value.first, source: 'BLE'));
+    }
+
+    if (!processed && _bleTextBuffer.length > 32) {
+      _bleTextBuffer = '';
+      statusMessage = 'Invalid gesture payload';
+      notifyListeners();
+    }
   }
 
   Future<void> _handleGestureId(int gestureId, {required String source}) async {

@@ -1,6 +1,5 @@
 #include <Wire.h>
 #include <math.h>
-#include <string>
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_MPU6050.h>
@@ -32,6 +31,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 // MPU6050
 // =========================
 Adafruit_MPU6050 mpu;
+bool mpuAvailable = false;
 
 // =========================
 // BLE Config
@@ -93,15 +93,26 @@ uint8_t stableGesture = G_NONE;
 int stableCount = 0;
 unsigned long lastGestureSentAt = 0;
 unsigned long lastDisplayAt = 0;
+unsigned long lastAnyPublishAt = 0;
+bool flex2InvalidNow = false;
 
 // Thresholds for your glove setup. Tune from Serial output.
-float FLEX_LOW = 80.0f;
-float FLEX_MID = 170.0f;
-float FLEX_HIGH = 260.0f;
+// Tuned for observed max around ~300 on OLED.
+float FLEX_LOW = 30.0f;
+float FLEX_MID = 110.0f;
+float FLEX_HIGH = 200.0f;
 float WAVE_GYRO_THRESHOLD = 130.0f;
 
-static const int STABLE_FRAMES_REQUIRED = 3;
-static const unsigned long MIN_SEND_GAP_MS = 700;
+// MPU orientation thresholds tuned for user-reported ranges:
+// pitch ~ [-25, 50], roll ~ [-30, 25]
+float PITCH_UP_HIGH = 24.0f;
+float PITCH_DOWN_LOW = -8.0f;
+float ROLL_RIGHT_HIGH = 12.0f;
+float ROLL_LEFT_LOW = -12.0f;
+
+static const int STABLE_FRAMES_REQUIRED = 2;
+static const unsigned long MIN_SEND_GAP_MS = 400;
+static const unsigned long FORCE_RESEND_MS = 2000;
 static const float LPF_ALPHA = 0.20f;
 
 void setupBle() {
@@ -127,16 +138,52 @@ void setupBle() {
 }
 
 void setupMpu() {
-  if (!mpu.begin()) {
-    Serial.println("[ERR] MPU6050 not detected");
-    while (true) {
-      delay(1000);
-    }
+  mpuAvailable = mpu.begin();
+  if (!mpuAvailable) {
+    Serial.println("[WARN] MPU6050 not detected, running in flex-only mode");
+    return;
   }
 
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
+
+uint8_t classifyGestureFlexOnly(float bend1, float bend2) {
+  // Both relaxed: treat as open palm so app always has a meaningful state.
+  if (bend1 < FLEX_LOW && bend2 < FLEX_LOW) {
+    return G_OPEN_PALM;
+  }
+
+  // Strong bends on both sensors.
+  if (bend1 > FLEX_HIGH && bend2 > FLEX_HIGH) {
+    return G_FIST;
+  }
+
+  // Directional two-sensor patterns.
+  if (bend1 > FLEX_HIGH && bend2 < FLEX_LOW) {
+    return G_POINT;
+  }
+
+  if (bend2 > FLEX_HIGH && bend1 < FLEX_LOW) {
+    return G_WAVE_LEFT;
+  }
+
+  if (bend1 > FLEX_MID && bend1 < FLEX_HIGH &&
+      bend2 > FLEX_MID && bend2 < FLEX_HIGH) {
+    return G_OK;
+  }
+
+  // Single-sensor fallback: if only one sensor responds, still emit gestures.
+  if (bend1 > FLEX_HIGH || bend2 > FLEX_HIGH) {
+    return (bend1 >= bend2) ? G_POINT : G_WAVE_LEFT;
+  }
+
+  if (bend1 > FLEX_MID || bend2 > FLEX_MID) {
+    return (bend1 >= bend2) ? G_OK : G_WAVE_RIGHT;
+  }
+
+  return G_NONE;
 }
 
 void setupDisplay() {
@@ -180,7 +227,7 @@ void pushGesture(uint8_t gestureId) {
     return;
   }
 
-  std::string payload = std::to_string(static_cast<int>(gestureId));
+  String payload = String(static_cast<int>(gestureId));
   payload += "\n";
   gestureChar->setValue(payload);
   gestureChar->notify();
@@ -193,36 +240,78 @@ uint8_t classifyGesture(
   float bend2,
   float pitchDeg,
   float rollDeg,
-  float gyroZ
+  float gyroZ,
+  bool flex2Invalid
 ) {
-  // Dynamic wave gestures first to avoid getting masked by static hand shape.
-  if (fabs(gyroZ) > WAVE_GYRO_THRESHOLD && bend1 < FLEX_MID && bend2 < FLEX_MID) {
+  const float bend2Effective = flex2Invalid ? 0.0f : bend2;
+
+  if (!mpuAvailable) {
+    return classifyGestureFlexOnly(bend1, bend2Effective);
+  }
+
+  // Orientation gestures from MPU (work even with one flex sensor).
+  if (pitchDeg >= PITCH_UP_HIGH) {
+    return G_WAVE_RIGHT;
+  }
+  if (pitchDeg <= PITCH_DOWN_LOW) {
+    return G_WAVE_LEFT;
+  }
+  if (rollDeg >= ROLL_RIGHT_HIGH) {
+    return G_OK;
+  }
+  if (rollDeg <= ROLL_LEFT_LOW) {
+    return G_FIST;
+  }
+
+  // Dynamic wave gestures from MPU should work even if one flex channel is noisy.
+  if (fabs(gyroZ) > (WAVE_GYRO_THRESHOLD * 0.7f) && bend1 < FLEX_MID) {
     if (gyroZ > 0) {
       return G_WAVE_RIGHT;
     }
     return G_WAVE_LEFT;
   }
 
-  if (bend1 > FLEX_HIGH && bend2 > FLEX_HIGH) {
+  if (bend1 > FLEX_HIGH && bend2Effective > (FLEX_MID * 0.6f)) {
     return G_FIST;
   }
 
-  if (bend1 < FLEX_LOW && bend2 < FLEX_LOW) {
+  if (bend1 < FLEX_LOW && bend2Effective < FLEX_LOW) {
     return G_OPEN_PALM;
   }
 
-  if (bend1 > FLEX_HIGH && bend2 < FLEX_LOW) {
+  if (bend1 > FLEX_HIGH && bend2Effective < FLEX_MID) {
     return G_POINT;
   }
 
-  if (bend1 > FLEX_MID && bend2 > FLEX_MID && fabs(pitchDeg) < 25.0f && fabs(rollDeg) < 40.0f) {
+  if (bend1 > FLEX_MID && bend1 < FLEX_HIGH &&
+      bend2Effective > FLEX_LOW && bend2Effective < FLEX_HIGH &&
+      fabs(pitchDeg) < 30.0f && fabs(rollDeg) < 45.0f) {
     return G_OK;
+  }
+
+  // Single-sensor + MPU fallback if flex2 is floating/saturated.
+  if (flex2Invalid) {
+    if (bend1 > FLEX_HIGH) {
+      return G_POINT;
+    }
+    if (bend1 > FLEX_MID) {
+      return G_OK;
+    }
+    return G_OPEN_PALM;
   }
 
   return G_NONE;
 }
 
-void updateDisplay(uint8_t gesture, bool connected, float bend1, float bend2) {
+void updateDisplay(
+  uint8_t gesture,
+  bool connected,
+  float bend1,
+  float bend2,
+  float pitchDeg,
+  float rollDeg,
+  bool f2Bad
+) {
   display.clearDisplay();
   display.setCursor(0, 0);
   display.print("BLE: ");
@@ -237,8 +326,13 @@ void updateDisplay(uint8_t gesture, bool connected, float bend1, float bend2) {
   display.setCursor(68, 28);
   display.printf("F2: %.0f", bend2);
 
-  display.setCursor(0, 44);
-  display.print("Stable: ");
+  display.setCursor(0, 42);
+  display.printf("P:%.1f R:%.1f", pitchDeg, rollDeg);
+
+  display.setCursor(0, 54);
+  display.print("F2:");
+  display.print(f2Bad ? "BAD" : "OK");
+  display.print(" S:");
   display.print(stableCount);
   display.print("/");
   display.println(STABLE_FRAMES_REQUIRED);
@@ -266,26 +360,43 @@ void loop() {
   const int raw1 = analogRead(FLEX1_PIN);
   const int raw2 = analogRead(FLEX2_PIN);
 
+  // Rail readings often indicate floating/disconnected analog input.
+  flex2InvalidNow = (raw2 <= 20 || raw2 >= 4075);
+
   flex1Filtered = (LPF_ALPHA * raw1) + ((1.0f - LPF_ALPHA) * flex1Filtered);
   flex2Filtered = (LPF_ALPHA * raw2) + ((1.0f - LPF_ALPHA) * flex2Filtered);
 
-  const float bend1 = max(0.0f, flex1Filtered - flex1Baseline);
-  const float bend2 = max(0.0f, flex2Filtered - flex2Baseline);
+  // Use absolute delta so wiring direction (increase/decrease on bend) both work.
+  const float bend1 = fabs(flex1Filtered - flex1Baseline);
+  const float bend2 = fabs(flex2Filtered - flex2Baseline);
 
-  sensors_event_t accel;
-  sensors_event_t gyro;
-  sensors_event_t temp;
-  mpu.getEvent(&accel, &gyro, &temp);
+  float pitchDeg = 0.0f;
+  float rollDeg = 0.0f;
+  float gyroZDeg = 0.0f;
 
-  const float ax = accel.acceleration.x;
-  const float ay = accel.acceleration.y;
-  const float az = accel.acceleration.z;
-  const float gyroZDeg = gyro.gyro.z * 57.2958f;
+  if (mpuAvailable) {
+    sensors_event_t accel;
+    sensors_event_t gyro;
+    sensors_event_t temp;
+    mpu.getEvent(&accel, &gyro, &temp);
 
-  const float pitchDeg = atan2(ax, sqrt((ay * ay) + (az * az))) * 57.2958f;
-  const float rollDeg = atan2(ay, az) * 57.2958f;
+    const float ax = accel.acceleration.x;
+    const float ay = accel.acceleration.y;
+    const float az = accel.acceleration.z;
+    gyroZDeg = gyro.gyro.z * 57.2958f;
 
-  uint8_t candidate = classifyGesture(bend1, bend2, pitchDeg, rollDeg, gyroZDeg);
+    pitchDeg = atan2(ax, sqrt((ay * ay) + (az * az))) * 57.2958f;
+    rollDeg = atan2(ay, az) * 57.2958f;
+  }
+
+  uint8_t candidate = classifyGesture(
+    bend1,
+    bend2,
+    pitchDeg,
+    rollDeg,
+    gyroZDeg,
+    flex2InvalidNow
+  );
 
   if (candidate == lastCandidate && candidate != G_NONE) {
     stableCount++;
@@ -295,22 +406,36 @@ void loop() {
   }
 
   const unsigned long now = millis();
-  if (candidate != G_NONE &&
-      stableCount >= STABLE_FRAMES_REQUIRED &&
-      candidate != stableGesture &&
-      (now - lastGestureSentAt) >= MIN_SEND_GAP_MS) {
-    stableGesture = candidate;
-    lastGestureSentAt = now;
-    pushGesture(candidate);
+  if (candidate != G_NONE && stableCount >= STABLE_FRAMES_REQUIRED) {
+    const bool changedGesture = candidate != stableGesture;
+    const bool minGapPassed = (now - lastGestureSentAt) >= MIN_SEND_GAP_MS;
+    const bool forceResend = (now - lastAnyPublishAt) >= FORCE_RESEND_MS;
+
+    if ((changedGesture && minGapPassed) || forceResend) {
+      stableGesture = candidate;
+      lastGestureSentAt = now;
+      lastAnyPublishAt = now;
+      pushGesture(candidate);
+    }
   }
 
   if ((now - lastDisplayAt) > 180) {
-    updateDisplay(stableGesture, bleConnected, bend1, bend2);
+    updateDisplay(
+      stableGesture,
+      bleConnected,
+      bend1,
+      bend2,
+      pitchDeg,
+      rollDeg,
+      flex2InvalidNow
+    );
     lastDisplayAt = now;
   }
 
   Serial.printf(
-    "F1=%d F2=%d B1=%.1f B2=%.1f pitch=%.1f roll=%.1f gz=%.1f cand=%u stable=%u\n",
+    "MPU=%d F2Bad=%d F1=%d F2=%d B1=%.1f B2=%.1f pitch=%.1f roll=%.1f gz=%.1f cand=%u stable=%u\n",
+    mpuAvailable ? 1 : 0,
+    flex2InvalidNow ? 1 : 0,
     raw1,
     raw2,
     bend1,
